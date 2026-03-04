@@ -98,103 +98,150 @@ app.get('/api/pair', async (req, res) => {
   const tempDir = path.join(os.tmpdir(), `loyalty-pair-${cleanNumber}-${Date.now()}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(tempDir);
+  // Track retries for server-busy errors
+  let retryCount = 0;
+  const MAX_RETRIES = 2;
+
+  // Helper to create a new socket and wire up events
+  async function createSocket() {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    const { state: authState, saveCreds: saveFn } = await useMultiFileAuthState(tempDir);
     const { version } = await fetchLatestBaileysVersion();
 
-    sock = makeWASocket({
+    const newSock = makeWASocket({
       version,
       printQRInTerminal: false,
       keepAliveIntervalMs: 25000,
       connectTimeoutMs: 55000,
       logger: pino({ level: 'silent' }),
       auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }).child({ level: 'silent' }))
+        creds: authState.creds,
+        keys: makeCacheableSignalKeyStore(authState.keys, pino({ level: 'silent' }).child({ level: 'silent' }))
       },
       browser: ["Ubuntu", "Chrome", "20.0.00"]
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    newSock.ev.on('creds.update', saveFn);
+    newSock.ev.on('connection.update', handleConnection);
 
-    // Connection event handler
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-      try {
-        if (connection === 'open' && !finished) {
-          finished = true;
-          console.log(`[PAIR] ${cleanNumber} connected!`);
+    return newSock;
+  }
 
-          // Read creds and encode
-          const credsPath = path.join(tempDir, 'creds.json');
-          if (!fs.existsSync(credsPath)) {
-            sendEvent({ type: 'error', error: 'Credentials file not created.' });
-            res.end();
-            return;
-          }
+  // Named connection handler (allows re-binding on retry)
+  async function handleConnection({ connection, lastDisconnect }) {
+    try {
+      if (connection === 'open' && !finished) {
+        finished = true;
+        console.log(`[PAIR] ${cleanNumber} connected!`);
 
-          const credsData = fs.readFileSync(credsPath, 'utf8');
-          const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+        // Read creds and encode
+        const credsPath = path.join(tempDir, 'creds.json');
+        if (!fs.existsSync(credsPath)) {
+          sendEvent({ type: 'error', error: 'Credentials file not created.' });
+          res.end();
+          return;
+        }
 
-          // Save to MongoDB if available
-          try {
-            const database = await getDB();
-            if (database) {
-              await database.collection('sessions').updateOne(
-                { sessionId: `session_${cleanNumber}` },
-                {
-                  $set: {
-                    sessionId: `session_${cleanNumber}`,
-                    creds: credsData,
-                    phone: cleanNumber,
-                    active: true,
-                    updatedAt: new Date()
-                  },
-                  $setOnInsert: { createdAt: new Date() }
+        const credsData = fs.readFileSync(credsPath, 'utf8');
+        const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+
+        // Save to MongoDB if available
+        try {
+          const database = await getDB();
+          if (database) {
+            await database.collection('sessions').updateOne(
+              { sessionId: `session_${cleanNumber}` },
+              {
+                $set: {
+                  sessionId: `session_${cleanNumber}`,
+                  creds: credsData,
+                  phone: cleanNumber,
+                  active: true,
+                  updatedAt: new Date()
                 },
-                { upsert: true }
-              );
-            }
-          } catch (dbErr) {
-            console.error('[DB] Save error:', dbErr.message);
+                $setOnInsert: { createdAt: new Date() }
+              },
+              { upsert: true }
+            );
           }
+        } catch (dbErr) {
+          console.error('[DB] Save error:', dbErr.message);
+        }
 
-          sendEvent({ type: 'connected', sessionId });
-          
-          // Cleanup
-          setTimeout(() => {
-            try { sock.end(); } catch (_) {}
-            try { res.end(); } catch (_) {}
-          }, 2000);
-          setTimeout(() => {
-            try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
-          }, 5000);
+        sendEvent({ type: 'connected', sessionId });
+        
+        // Cleanup
+        setTimeout(() => {
+          try { sock.end(); } catch (_) {}
+          try { res.end(); } catch (_) {}
+        }, 2000);
+        setTimeout(() => {
+          try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+        }, 5000);
 
-        } else if (connection === 'close' && !finished) {
-          const statusCode = lastDisconnect?.error?.output?.statusCode;
-          console.log(`[PAIR] ${cleanNumber} closed (code: ${statusCode})`);
-          
-          if (statusCode === 401 || statusCode === 403) {
-            sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
-          } else if (statusCode === 515 || statusCode === 503) {
-            sendEvent({ type: 'error', error: 'WhatsApp server busy. Wait a moment and try again.' });
-          } else {
-            sendEvent({ type: 'error', error: `Connection lost (${statusCode}). Reload and try again.` });
-          }
+      } else if (connection === 'close' && !finished) {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        console.log(`[PAIR] ${cleanNumber} closed (code: ${statusCode})`);
+        
+        if (statusCode === 401 || statusCode === 403) {
+          sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
           finished = true;
           try { res.end(); } catch (_) {}
-        }
-      } catch (err) {
-        console.error('[PAIR] connection.update error:', err);
-        if (!finished) {
-          sendEvent({ type: 'error', error: err.message });
+        } else if ((statusCode === 515 || statusCode === 503) && retryCount < MAX_RETRIES) {
+          // WhatsApp server busy — auto-retry
+          retryCount++;
+          console.log(`[PAIR] Server busy, retrying (${retryCount}/${MAX_RETRIES})...`);
+          sendEvent({ type: 'status', message: `WhatsApp server busy. Retrying (${retryCount}/${MAX_RETRIES})...` });
+          
+          try { sock.end(); } catch (_) {}
+          await new Promise(r => setTimeout(r, 3000));
+          
+          // Create a fresh socket
+          sock = await createSocket();
+
+          // Request pairing code after reconnect
+          setTimeout(async () => {
+            try {
+              if (!finished && !sock.authState.creds.registered) {
+                const code = await sock.requestPairingCode(cleanNumber);
+                console.log(`[PAIR] Retry code for ${cleanNumber}: ${code}`);
+                sendEvent({ type: 'code', code });
+              }
+            } catch (e) {
+              console.error('[PAIR] Retry pairing code error:', e.message);
+              sendEvent({ type: 'error', error: 'Failed to get pairing code on retry.' });
+              finished = true;
+              try { res.end(); } catch (_) {}
+            }
+          }, 3000);
+        } else if (statusCode === 515 || statusCode === 503) {
+          sendEvent({ type: 'error', error: 'WhatsApp server busy. Please wait a minute and try again.' });
+          finished = true;
+          try { res.end(); } catch (_) {}
+        } else {
+          sendEvent({ type: 'error', error: `Connection lost (${statusCode}). Reload and try again.` });
           finished = true;
           try { res.end(); } catch (_) {}
         }
       }
-    });
+    } catch (err) {
+      console.error('[PAIR] connection.update error:', err);
+      if (!finished) {
+        sendEvent({ type: 'error', error: err.message });
+        finished = true;
+        try { res.end(); } catch (_) {}
+      }
+    }
+  }
+
+  try {
+    // Create initial socket
+    sock = await createSocket();
 
     // Wait for socket init, then request pairing code
-    await new Promise(resolve => setTimeout(resolve, 2500));
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
     if (finished) return; // Already errored out
 
