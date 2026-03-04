@@ -123,7 +123,52 @@ app.get('/api/pair', async (req, res) => {
       browser: ["Ubuntu", "Chrome", "20.0.00"]
     });
 
-    newSock.ev.on('creds.update', saveFn);
+    newSock.ev.on('creds.update', async () => {
+      await saveFn();
+      // Check if pairing just completed (registered became true)
+      try {
+        const credsPath = path.join(tempDir, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+          const savedCreds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+          if (savedCreds.registered && !finished) {
+            finished = true;
+            console.log(`[PAIR] ${cleanNumber} paired via creds.update!`);
+            const credsData = fs.readFileSync(credsPath, 'utf8');
+            const sid = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+            // Save to MongoDB if available
+            try {
+              const database = await getDB();
+              if (database) {
+                await database.collection('sessions').updateOne(
+                  { sessionId: `session_${cleanNumber}` },
+                  {
+                    $set: {
+                      sessionId: `session_${cleanNumber}`,
+                      creds: credsData,
+                      phone: cleanNumber,
+                      active: true,
+                      updatedAt: new Date()
+                    },
+                    $setOnInsert: { createdAt: new Date() }
+                  },
+                  { upsert: true }
+                );
+              }
+            } catch (dbErr) {
+              console.error('[DB] Save error:', dbErr.message);
+            }
+            sendEvent({ type: 'connected', sessionId: sid });
+            setTimeout(() => {
+              try { newSock.end(); } catch (_) {}
+              try { res.end(); } catch (_) {}
+            }, 2000);
+            setTimeout(() => {
+              try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+            }, 5000);
+          }
+        }
+      } catch (_) {}
+    });
     newSock.ev.on('connection.update', handleConnection);
 
     return newSock;
@@ -184,8 +229,53 @@ app.get('/api/pair', async (req, res) => {
       } else if (connection === 'close' && !finished) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`[PAIR] ${cleanNumber} closed (code: ${statusCode})`);
-        
-        if (statusCode === 401 || statusCode === 403) {
+
+        // Status 428 = restart required — pairing may have succeeded
+        // Check if creds were saved with registered=true
+        if (statusCode === 428) {
+          console.log(`[PAIR] ${cleanNumber} got 428 (restart required), checking creds...`);
+          await new Promise(r => setTimeout(r, 1500));
+          try {
+            const credsPath = path.join(tempDir, 'creds.json');
+            if (fs.existsSync(credsPath)) {
+              const savedCreds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+              if (savedCreds.registered && !finished) {
+                finished = true;
+                const credsData = fs.readFileSync(credsPath, 'utf8');
+                const sid = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+                try {
+                  const database = await getDB();
+                  if (database) {
+                    await database.collection('sessions').updateOne(
+                      { sessionId: `session_${cleanNumber}` },
+                      {
+                        $set: {
+                          sessionId: `session_${cleanNumber}`,
+                          creds: credsData,
+                          phone: cleanNumber,
+                          active: true,
+                          updatedAt: new Date()
+                        },
+                        $setOnInsert: { createdAt: new Date() }
+                      },
+                      { upsert: true }
+                    );
+                  }
+                } catch (dbErr) {
+                  console.error('[DB] Save error:', dbErr.message);
+                }
+                sendEvent({ type: 'connected', sessionId: sid });
+                setTimeout(() => { try { res.end(); } catch (_) {} }, 2000);
+                setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {} }, 5000);
+                return;
+              }
+            }
+          } catch (_) {}
+          // If creds not registered, treat as error
+          sendEvent({ type: 'error', error: 'Connection restarted. Reload and try again.' });
+          finished = true;
+          try { res.end(); } catch (_) {}
+        } else if (statusCode === 401 || statusCode === 403) {
           sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
           finished = true;
           try { res.end(); } catch (_) {}
