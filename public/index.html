@@ -210,9 +210,9 @@
         <button class="copy-btn" id="copyCodeBtn" onclick="copyCode()">📋 Copy Code</button>
       </div>
       <p><span class="spinner"></span> Waiting for you to pair...</p>
-      <p class="timer" id="timer">⏱ 55 seconds remaining</p>
+      <p class="timer" id="timer">⏱ Waiting...</p>
       <div class="info warn" style="margin-top:15px;">
-        Enter the code within 55 seconds before it expires.
+        Enter the code on your phone. Keep this page open until pairing completes.
       </div>
     </div>
 
@@ -338,7 +338,7 @@
             // Got pairing code!
             renderCode(data.code);
             showStep(2);
-            startTimer(55);
+            startTimer(120); // generous timer, server handles real timeout
           }
           else if (data.type === 'connected') {
             // Success! Got session ID
