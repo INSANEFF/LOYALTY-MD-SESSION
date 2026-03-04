@@ -263,22 +263,24 @@
     }
 
     function renderCode(code) {
-      currentCode = code;
+      currentCode = code.replace(/-/g, ''); // store without dashes for clipboard
       const container = document.getElementById('pairingCode');
       container.innerHTML = '';
-      const chars = code.replace(/[^A-Z0-9]/gi, '');
-      for (let i = 0; i < chars.length; i++) {
-        if (i === 4) {
+      const parts = code.split('-');
+      parts.forEach((part, pi) => {
+        if (pi > 0) {
           const dash = document.createElement('div');
           dash.className = 'code-dash';
           dash.textContent = '-';
           container.appendChild(dash);
         }
-        const box = document.createElement('div');
-        box.className = 'code-char';
-        box.textContent = chars[i];
-        container.appendChild(box);
-      }
+        for (const ch of part) {
+          const box = document.createElement('div');
+          box.className = 'code-char';
+          box.textContent = ch;
+          container.appendChild(box);
+        }
+      });
     }
 
     function startTimer(seconds) {
@@ -323,6 +325,8 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Connecting...';
 
+      let codeReceived = false;
+
       // Open SSE connection
       const evtSource = new EventSource('/api/pair?phone=' + encodeURIComponent(phone));
 
@@ -331,14 +335,19 @@
           const data = JSON.parse(event.data);
           
           if (data.type === 'status') {
-            // Status update, keep waiting
-            btn.innerHTML = '<span class="spinner"></span> ' + data.message;
+            // Status update — if we already have the code, show on step 2
+            if (codeReceived) {
+              document.getElementById('timer').textContent = '⏳ ' + data.message;
+            } else {
+              btn.innerHTML = '<span class="spinner"></span> ' + data.message;
+            }
           }
           else if (data.type === 'code') {
             // Got pairing code!
+            codeReceived = true;
             renderCode(data.code);
             showStep(2);
-            startTimer(120); // generous timer, server handles real timeout
+            startTimer(300); // 5 min generous timer, server handles real timeout
           }
           else if (data.type === 'connected') {
             // Success! Got session ID
