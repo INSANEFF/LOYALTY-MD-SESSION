@@ -1,14 +1,9 @@
 /*
   LOYALTY MD Session Generator API
+  Works on Vercel (with SSE) and persistent servers (Render, Railway, VPS).
   
-  ⚠️ This needs a PERSISTENT server (Render, Railway, VPS).
-  Vercel serverless CANNOT keep WebSocket connections alive.
-  
-  Deploy on Render.com (free):
-    - New Web Service → Connect GitHub repo
-    - Build Command: npm install
-    - Start Command: node api/index.js
-    - Set MONGODB_URI env var (optional)
+  Key: Uses Server-Sent Events so the connection stays alive
+  during the entire pairing process (up to 55 seconds).
 */
 
 const {
@@ -30,11 +25,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// In-memory store for active pairing requests and sockets
-const pairingRequests = {};
-const activeSockets = {};
-
-// MongoDB connection
+// MongoDB connection (optional)
 let db = null;
 async function getDB() {
   if (db) return db;
@@ -56,32 +47,66 @@ async function getDB() {
 }
 
 /**
- * POST /api/pair
- * Body: { phone: "1234567890" }
- * Returns: { success, requestId, pairingCode }
+ * GET /api/pair?phone=1234567890
+ * 
+ * Uses Server-Sent Events (SSE) to keep the connection alive.
+ * Flow:
+ *   1. Client opens SSE connection
+ *   2. Server creates Baileys socket, gets pairing code
+ *   3. Server sends pairing code event → client displays it
+ *   4. Server waits for user to enter code on phone (up to 55s)
+ *   5. Server sends session ID event → client shows it
+ *   6. Connection closes
  */
-app.post('/api/pair', async (req, res) => {
-  try {
-    const { phone } = req.body;
-    if (!phone || phone.length < 7) {
+app.get('/api/pair', async (req, res) => {
+  const { phone } = req.query;
+  if (!phone || phone.replace(/[^0-9]/g, '').length < 7) {
+    // If not SSE request, return JSON error
+    if (req.headers.accept !== 'text/event-stream') {
       return res.json({ success: false, error: 'Invalid phone number.' });
     }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    res.write(`data: ${JSON.stringify({ type: 'error', error: 'Invalid phone number.' })}\n\n`);
+    res.end();
+    return;
+  }
 
-    const cleanNumber = phone.replace(/[^0-9]/g, '');
-    const requestId = `pair_${cleanNumber}_${Date.now()}`;
-    const tempDir = path.join(os.tmpdir(), 'loyalty-sessions', requestId);
-    fs.mkdirSync(tempDir, { recursive: true });
+  const cleanNumber = phone.replace(/[^0-9]/g, '');
 
-    pairingRequests[requestId] = { status: 'initializing', phone: cleanNumber };
+  // Set up SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no' // Disable nginx buffering
+  });
 
+  // Helper to send SSE events
+  function sendEvent(data) {
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (_) {}
+  }
+
+  sendEvent({ type: 'status', message: 'Connecting to WhatsApp...' });
+
+  let sock = null;
+  let finished = false;
+
+  const tempDir = path.join(os.tmpdir(), `loyalty-pair-${cleanNumber}-${Date.now()}`);
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  try {
     const { state, saveCreds } = await useMultiFileAuthState(tempDir);
     const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
+    sock = makeWASocket({
       version,
       printQRInTerminal: false,
       keepAliveIntervalMs: 25000,
-      connectTimeoutMs: 60000,
+      connectTimeoutMs: 55000,
       logger: pino({ level: 'silent' }),
       auth: {
         creds: state.creds,
@@ -90,23 +115,23 @@ app.post('/api/pair', async (req, res) => {
       browser: ["Ubuntu", "Chrome", "20.0.00"]
     });
 
-    // Keep reference so it doesn't get GC'd
-    activeSockets[requestId] = sock;
-
     sock.ev.on('creds.update', saveCreds);
 
-    // Listen for connection events
+    // Connection event handler
     sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
       try {
-        if (connection === 'open') {
-          console.log(`[PAIR] ${requestId} connected!`);
-          
+        if (connection === 'open' && !finished) {
+          finished = true;
+          console.log(`[PAIR] ${cleanNumber} connected!`);
+
+          // Read creds and encode
           const credsPath = path.join(tempDir, 'creds.json');
           if (!fs.existsSync(credsPath)) {
-            pairingRequests[requestId] = { status: 'error', error: 'Credentials file not found.' };
+            sendEvent({ type: 'error', error: 'Credentials file not created.' });
+            res.end();
             return;
           }
-          
+
           const credsData = fs.readFileSync(credsPath, 'utf8');
           const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
 
@@ -114,12 +139,11 @@ app.post('/api/pair', async (req, res) => {
           try {
             const database = await getDB();
             if (database) {
-              const sessionName = `session_${cleanNumber}`;
               await database.collection('sessions').updateOne(
-                { sessionId: sessionName },
+                { sessionId: `session_${cleanNumber}` },
                 {
                   $set: {
-                    sessionId: sessionName,
+                    sessionId: `session_${cleanNumber}`,
                     creds: credsData,
                     phone: cleanNumber,
                     active: true,
@@ -129,114 +153,109 @@ app.post('/api/pair', async (req, res) => {
                 },
                 { upsert: true }
               );
-              console.log(`[DB] Saved session for ${cleanNumber}`);
             }
           } catch (dbErr) {
             console.error('[DB] Save error:', dbErr.message);
           }
 
-          pairingRequests[requestId] = {
-            status: 'connected',
-            sessionId,
-            phone: cleanNumber
-          };
-
-          // Disconnect after saving
+          sendEvent({ type: 'connected', sessionId });
+          
+          // Cleanup
           setTimeout(() => {
             try { sock.end(); } catch (_) {}
-            delete activeSockets[requestId];
-          }, 3000);
-
-          // Clean up temp files
+            try { res.end(); } catch (_) {}
+          }, 2000);
           setTimeout(() => {
             try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
-          }, 8000);
+          }, 5000);
 
-        } else if (connection === 'close') {
+        } else if (connection === 'close' && !finished) {
           const statusCode = lastDisconnect?.error?.output?.statusCode;
-          console.log(`[PAIR] ${requestId} closed (code: ${statusCode})`);
+          console.log(`[PAIR] ${cleanNumber} closed (code: ${statusCode})`);
           
-          if (pairingRequests[requestId]?.status !== 'connected') {
-            if (statusCode === 401 || statusCode === 403) {
-              pairingRequests[requestId] = { status: 'error', error: 'Pairing rejected or expired. Try again.' };
-            } else if (statusCode === 515 || statusCode === 503) {
-              pairingRequests[requestId] = { status: 'error', error: 'WhatsApp server unavailable. Try again in a moment.' };
-            } else {
-              pairingRequests[requestId] = { status: 'error', error: `Connection closed (code: ${statusCode}). Try again.` };
-            }
+          if (statusCode === 401 || statusCode === 403) {
+            sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
+          } else if (statusCode === 515 || statusCode === 503) {
+            sendEvent({ type: 'error', error: 'WhatsApp server busy. Wait a moment and try again.' });
+          } else {
+            sendEvent({ type: 'error', error: `Connection lost (${statusCode}). Reload and try again.` });
           }
-          delete activeSockets[requestId];
+          finished = true;
+          try { res.end(); } catch (_) {}
         }
       } catch (err) {
-        console.error(`[PAIR] connection.update error:`, err);
-        pairingRequests[requestId] = { status: 'error', error: err.message };
+        console.error('[PAIR] connection.update error:', err);
+        if (!finished) {
+          sendEvent({ type: 'error', error: err.message });
+          finished = true;
+          try { res.end(); } catch (_) {}
+        }
       }
     });
 
-    // Wait for socket to initialize before requesting pairing code
+    // Wait for socket init, then request pairing code
     await new Promise(resolve => setTimeout(resolve, 2500));
 
-    if (!sock.authState.creds.registered) {
-      try {
-        const pairingCode = await sock.requestPairingCode(cleanNumber);
-        pairingRequests[requestId] = { 
-          status: 'pairing', 
-          pairingCode, 
-          phone: cleanNumber 
-        };
-        console.log(`[PAIR] Code for ${cleanNumber}: ${pairingCode}`);
+    if (finished) return; // Already errored out
 
-        res.json({ success: true, requestId, pairingCode });
-      } catch (pairErr) {
-        console.error(`[PAIR] requestPairingCode error:`, pairErr);
-        pairingRequests[requestId] = { status: 'error', error: 'Failed to generate pairing code.' };
-        try { sock.end(); } catch (_) {}
-        delete activeSockets[requestId];
-        res.json({ success: false, error: 'Failed to generate pairing code. Check your number and try again.' });
-      }
+    if (!sock.authState.creds.registered) {
+      const pairingCode = await sock.requestPairingCode(cleanNumber);
+      console.log(`[PAIR] Code for ${cleanNumber}: ${pairingCode}`);
+      sendEvent({ type: 'code', code: pairingCode });
     } else {
-      pairingRequests[requestId] = { status: 'error', error: 'Already registered.' };
-      res.json({ success: false, error: 'Already registered.' });
+      sendEvent({ type: 'error', error: 'Number already registered.' });
+      finished = true;
+      res.end();
+      return;
     }
 
-    // Auto-cleanup after 3 minutes
+    // Timeout after 55 seconds (Vercel limit is 60s)
     setTimeout(() => {
-      if (pairingRequests[requestId]?.status === 'pairing') {
-        pairingRequests[requestId] = { status: 'error', error: 'Timed out (3 minutes).' };
-        try { if (activeSockets[requestId]) activeSockets[requestId].end(); } catch (_) {}
-        delete activeSockets[requestId];
+      if (!finished) {
+        sendEvent({ type: 'error', error: 'Timed out (55s). Reload and try again.' });
+        finished = true;
+        try { sock.end(); } catch (_) {}
+        try { res.end(); } catch (_) {}
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
       }
-      setTimeout(() => { delete pairingRequests[requestId]; }, 7 * 60 * 1000);
-    }, 3 * 60 * 1000);
+    }, 55000);
 
   } catch (err) {
     console.error('[PAIR] Error:', err);
-    return res.json({ success: false, error: err.message });
+    sendEvent({ type: 'error', error: err.message || 'Failed to connect.' });
+    finished = true;
+    try { if (sock) sock.end(); } catch (_) {}
+    try { res.end(); } catch (_) {}
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
   }
+
+  // If client disconnects early, clean up
+  req.on('close', () => {
+    if (!finished) {
+      finished = true;
+      try { if (sock) sock.end(); } catch (_) {}
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
 });
 
-/**
- * GET /api/status?id=<requestId>
- */
-app.get('/api/status', (req, res) => {
-  const { id } = req.query;
-  if (!id || !pairingRequests[id]) {
-    return res.json({ status: 'error', error: 'Invalid or expired request. Please try again.' });
-  }
-  return res.json(pairingRequests[id]);
+// Legacy POST endpoint (for Render/persistent servers)
+app.post('/api/pair', async (req, res) => {
+  // Redirect to SSE approach
+  const phone = req.body?.phone;
+  if (!phone) return res.json({ success: false, error: 'Missing phone number.' });
+  return res.json({ 
+    success: false, 
+    error: 'Use the web interface instead.',
+    redirect: `/api/pair?phone=${phone.replace(/[^0-9]/g, '')}` 
+  });
 });
 
 /**
  * GET /api/health
  */
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    name: 'LOYALTY MD Session Generator', 
-    activePairings: Object.keys(pairingRequests).length,
-    activeSockets: Object.keys(activeSockets).length
-  });
+  res.json({ status: 'ok', name: 'LOYALTY MD Session Generator' });
 });
 
 // Serve index.html for root
@@ -244,13 +263,15 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-// Start server (persistent — works on Render, Railway, VPS)
+// Start server (for Render, Railway, VPS, local dev)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n====================================`);
-  console.log(`  👑 LOYALTY MD Session Generator`);
-  console.log(`  🌐 Running on port ${PORT}`);
-  console.log(`====================================\n`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`\n====================================`);
+    console.log(`  👑 LOYALTY MD Session Generator`);
+    console.log(`  🌐 Running on port ${PORT}`);
+    console.log(`====================================\n`);
+  });
+}
 
 module.exports = app;

@@ -74,27 +74,39 @@
     .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,210,255,0.3); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
     .pairing-code {
-      font-size: 36px;
-      font-weight: bold;
-      letter-spacing: 8px;
-      background: linear-gradient(90deg, #00d2ff, #3a7bd5);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
+      display: flex;
+      justify-content: center;
+      gap: 6px;
       margin: 20px 0;
-      font-family: 'Courier New', monospace;
+      flex-wrap: wrap;
     }
-    .session-id-box {
-      background: rgba(0,0,0,0.3);
-      border-radius: 12px;
-      padding: 15px;
-      margin: 20px 0;
-      word-break: break-all;
+    .code-char {
+      background: rgba(0,210,255,0.12);
+      border: 2px solid rgba(0,210,255,0.4);
+      border-radius: 10px;
+      width: 44px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 28px;
+      font-weight: bold;
       font-family: 'Courier New', monospace;
-      font-size: 12px;
-      color: #0f0;
-      max-height: 120px;
-      overflow-y: auto;
-      text-align: left;
+      color: #00d2ff;
+      user-select: all;
+    }
+    .code-dash {
+      display: flex;
+      align-items: center;
+      font-size: 28px;
+      color: #555;
+      padding: 0 2px;
+    }
+    .copy-row {
+      display: flex;
+      gap: 8px;
+      margin: 12px 0;
+      justify-content: center;
     }
     .copy-btn {
       background: rgba(255,255,255,0.1);
@@ -104,16 +116,33 @@
       border-radius: 8px;
       cursor: pointer;
       font-size: 14px;
-      margin-top: 10px;
       transition: all 0.3s;
     }
     .copy-btn:hover { background: rgba(255,255,255,0.2); }
+    .copy-btn.copied { background: rgba(0,255,100,0.2); border-color: rgba(0,255,100,0.4); }
+    .session-id-box {
+      background: rgba(0,0,0,0.4);
+      border-radius: 12px;
+      padding: 15px;
+      margin: 20px 0;
+      word-break: break-all;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      color: #0f0;
+      max-height: 140px;
+      overflow-y: auto;
+      text-align: left;
+      user-select: all;
+      cursor: text;
+      border: 1px solid rgba(0,255,100,0.2);
+    }
     .info {
       margin-top: 15px;
       padding: 12px;
       border-radius: 10px;
       font-size: 13px;
       color: #ccc;
+      text-align: left;
     }
     .info.warn { background: rgba(255,200,0,0.1); border: 1px solid rgba(255,200,0,0.2); }
     .info.success { background: rgba(0,255,100,0.1); border: 1px solid rgba(0,255,100,0.2); }
@@ -141,9 +170,12 @@
       height: 10px;
       border-radius: 50%;
       background: rgba(255,255,255,0.2);
+      transition: background 0.3s;
     }
     .step-dot.active { background: #3a7bd5; }
     .step-dot.done { background: #0f0; }
+    .timer { color: #aaa; font-size: 12px; margin-top: 8px; }
+    code { background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -162,52 +194,60 @@
     <div class="step active" id="step1">
       <label for="phone">WhatsApp Number (with country code)</label>
       <input type="text" id="phone" placeholder="e.g. 12025551234" />
-      <button class="btn" id="pairBtn" onclick="requestPair()">Get Pairing Code</button>
+      <button class="btn" id="pairBtn" onclick="startPairing()">Get Pairing Code</button>
       <div class="info warn">
-        <strong>Note:</strong> Enter your full number without + or spaces.
-        The bot account number, not your personal one.
+        <strong>📌 Note:</strong> Enter the full number without + or spaces.
+        This is the number that will run as a bot.
       </div>
     </div>
 
     <!-- Step 2: Show pairing code -->
     <div class="step" id="step2">
       <p>Enter this code on your WhatsApp:</p>
-      <p style="font-size:12px; color:#aaa;">Settings → Linked Devices → Link a Device</p>
-      <div class="pairing-code" id="pairingCode">--------</div>
+      <p style="font-size:12px; color:#aaa; margin-top:4px;">Settings → Linked Devices → Link a Device</p>
+      <div class="pairing-code" id="pairingCode"></div>
+      <div class="copy-row">
+        <button class="copy-btn" id="copyCodeBtn" onclick="copyCode()">📋 Copy Code</button>
+      </div>
       <p><span class="spinner"></span> Waiting for you to pair...</p>
+      <p class="timer" id="timer">⏱ 55 seconds remaining</p>
       <div class="info warn" style="margin-top:15px;">
-        Enter the code within 60 seconds before it expires.
+        Enter the code within 55 seconds before it expires.
       </div>
     </div>
 
     <!-- Step 3: Session ID -->
     <div class="step" id="step3">
-      <p>✅ Paired successfully! Here's your Session ID:</p>
-      <div class="session-id-box" id="sessionIdBox">loading...</div>
-      <button class="copy-btn" onclick="copySession()">📋 Copy Session ID</button>
-      <div class="info success" style="margin-top:15px;">
-        <strong>How to use:</strong><br>
-        1. Copy the Session ID above<br>
-        2. In your hosting panel, set environment variable:<br>
-        <code>SESSION_ID=LOYALTY-MD~...</code><br>
-        3. Or send to your bot: <code>addsession &lt;session_id&gt;</code>
+      <p>✅ <strong>Paired successfully!</strong> Here's your Session ID:</p>
+      <div class="session-id-box" id="sessionIdBox"></div>
+      <div class="copy-row">
+        <button class="copy-btn" onclick="copySession()">📋 Copy Session ID</button>
+      </div>
+      <div class="info success">
+        <strong>How to deploy:</strong><br>
+        1. In your hosting panel, set environment variable:<br>
+        <code>SESSION_ID</code> = the value above<br><br>
+        2. Or send to your running bot:<br>
+        <code>addsession &lt;paste_id_here&gt;</code>
       </div>
     </div>
 
     <!-- Error state -->
     <div class="step" id="stepError">
       <div class="info error" id="errorMsg">An error occurred.</div>
-      <button class="btn" style="margin-top:15px;" onclick="location.reload()">Try Again</button>
+      <button class="btn" style="margin-top:15px;" onclick="location.reload()">🔄 Try Again</button>
     </div>
   </div>
 
   <script>
-    let pollInterval = null;
-    let requestId = null;
+    let currentCode = '';
+    let currentSessionId = '';
+    let timerInterval = null;
 
     function showStep(n) {
       document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
-      document.getElementById('step' + n)?.classList.add('active');
+      const stepEl = document.getElementById('step' + n);
+      if (stepEl) stepEl.classList.add('active');
       document.getElementById('stepError')?.classList.remove('active');
       for (let i = 1; i <= 3; i++) {
         const dot = document.getElementById('dot' + i);
@@ -219,73 +259,115 @@
       document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
       document.getElementById('stepError').classList.add('active');
       document.getElementById('errorMsg').textContent = msg;
-      if (pollInterval) clearInterval(pollInterval);
+      if (timerInterval) clearInterval(timerInterval);
     }
 
-    async function requestPair() {
-      const phone = document.getElementById('phone').value.replace(/[^0-9]/g, '');
-      if (phone.length < 7) return alert('Please enter a valid phone number with country code.');
-
-      const btn = document.getElementById('pairBtn');
-      btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span> Generating...';
-
-      try {
-        const res = await fetch('/api/pair', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ phone })
-        });
-        const data = await res.json();
-
-        if (!data.success) {
-          showError(data.error || 'Failed to generate pairing code.');
-          return;
+    function renderCode(code) {
+      currentCode = code;
+      const container = document.getElementById('pairingCode');
+      container.innerHTML = '';
+      const chars = code.replace(/[^A-Z0-9]/gi, '');
+      for (let i = 0; i < chars.length; i++) {
+        if (i === 4) {
+          const dash = document.createElement('div');
+          dash.className = 'code-dash';
+          dash.textContent = '-';
+          container.appendChild(dash);
         }
-
-        requestId = data.requestId;
-        document.getElementById('pairingCode').textContent = data.pairingCode;
-        showStep(2);
-
-        // Poll for completion
-        pollInterval = setInterval(async () => {
-          try {
-            const pollRes = await fetch('/api/status?id=' + requestId);
-            const pollData = await pollRes.json();
-
-            if (pollData.status === 'connected') {
-              clearInterval(pollInterval);
-              document.getElementById('sessionIdBox').textContent = pollData.sessionId;
-              showStep(3);
-            } else if (pollData.status === 'error') {
-              clearInterval(pollInterval);
-              showError(pollData.error || 'Pairing failed. Try again.');
-            }
-          } catch (e) {
-            // keep polling
-          }
-        }, 3000);
-
-        // Timeout after 90 seconds
-        setTimeout(() => {
-          if (pollInterval) {
-            clearInterval(pollInterval);
-            showError('Pairing timed out. Please try again.');
-          }
-        }, 90000);
-
-      } catch (err) {
-        showError('Network error: ' + err.message);
+        const box = document.createElement('div');
+        box.className = 'code-char';
+        box.textContent = chars[i];
+        container.appendChild(box);
       }
+    }
+
+    function startTimer(seconds) {
+      let remaining = seconds;
+      const el = document.getElementById('timer');
+      timerInterval = setInterval(() => {
+        remaining--;
+        if (remaining <= 0) {
+          clearInterval(timerInterval);
+          el.textContent = '⏱ Time expired';
+        } else {
+          el.textContent = `⏱ ${remaining} seconds remaining`;
+        }
+      }, 1000);
+    }
+
+    function copyCode() {
+      navigator.clipboard.writeText(currentCode).then(() => {
+        const btn = document.getElementById('copyCodeBtn');
+        btn.textContent = '✅ Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = '📋 Copy Code'; btn.classList.remove('copied'); }, 2000);
+      });
     }
 
     function copySession() {
       const text = document.getElementById('sessionIdBox').textContent;
       navigator.clipboard.writeText(text).then(() => {
-        const btn = document.querySelector('.copy-btn');
+        const btns = document.querySelectorAll('.copy-btn');
+        const btn = btns[btns.length - 1];
         btn.textContent = '✅ Copied!';
-        setTimeout(() => btn.textContent = '📋 Copy Session ID', 2000);
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = '📋 Copy Session ID'; btn.classList.remove('copied'); }, 2000);
       });
+    }
+
+    function startPairing() {
+      const phone = document.getElementById('phone').value.replace(/[^0-9]/g, '');
+      if (phone.length < 7) return alert('Please enter a valid phone number with country code.');
+
+      const btn = document.getElementById('pairBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Connecting...';
+
+      // Open SSE connection
+      const evtSource = new EventSource('/api/pair?phone=' + encodeURIComponent(phone));
+
+      evtSource.onmessage = function(event) {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'status') {
+            // Status update, keep waiting
+            btn.innerHTML = '<span class="spinner"></span> ' + data.message;
+          }
+          else if (data.type === 'code') {
+            // Got pairing code!
+            renderCode(data.code);
+            showStep(2);
+            startTimer(55);
+          }
+          else if (data.type === 'connected') {
+            // Success! Got session ID
+            if (timerInterval) clearInterval(timerInterval);
+            currentSessionId = data.sessionId;
+            document.getElementById('sessionIdBox').textContent = data.sessionId;
+            showStep(3);
+            evtSource.close();
+          }
+          else if (data.type === 'error') {
+            if (timerInterval) clearInterval(timerInterval);
+            showError(data.error || 'An error occurred.');
+            evtSource.close();
+          }
+        } catch (e) {
+          console.error('Parse error:', e);
+        }
+      };
+
+      evtSource.onerror = function() {
+        // SSE connection closed or errored
+        evtSource.close();
+        // Only show error if we haven't already shown step 3
+        const step3 = document.getElementById('step3');
+        if (!step3.classList.contains('active')) {
+          if (timerInterval) clearInterval(timerInterval);
+          showError('Connection lost. Please reload and try again.');
+        }
+      };
     }
   </script>
 </body>
