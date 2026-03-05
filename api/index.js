@@ -100,6 +100,12 @@ app.get('/api/pair', async (req, res) => {
   let pairingCodeSent = false;
   let reconnectAttempts = 0;
   let timeoutHandle = null;
+  let heartbeatHandle = null;
+
+  // Send SSE heartbeat every 10s to prevent Vercel/proxy from closing the connection
+  heartbeatHandle = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (_) {}
+  }, 10000);
 
   async function cleanup(reason = 'unknown') {
     if (isCleaningUp) return;
@@ -107,6 +113,7 @@ app.get('/api/pair', async (req, res) => {
     console.log(`[PAIR] Cleanup ${num} — ${reason}`);
 
     if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+    if (heartbeatHandle) { clearInterval(heartbeatHandle); heartbeatHandle = null; }
 
     if (currentSocket) {
       try {
@@ -233,14 +240,14 @@ app.get('/api/pair', async (req, res) => {
             reconnectAttempts++;
             console.log(`[PAIR] ${num} reconnecting (${reconnectAttempts}/${MAX_RECONNECTS})...`);
             sendEvent({ type: 'status', message: pairingCodeSent ? 'Finalizing connection...' : 'Reconnecting...' });
-            await delay(2000);
+            await delay(1000);
             await initiateSession();
           }
         }
       });
 
       if (!sock.authState.creds.registered && !pairingCodeSent && !isCleaningUp) {
-        await delay(1500);
+        await delay(500);
         try {
           pairingCodeSent = true;
           let code = await sock.requestPairingCode(num);

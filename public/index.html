@@ -368,13 +368,17 @@
       };
 
       evtSource.onerror = function() {
-        // SSE connection closed or errored
         evtSource.close();
-        // Only show error if we haven't already shown step 3
+        // Only show error if we haven't already completed
         const step3 = document.getElementById('step3');
         if (!step3.classList.contains('active')) {
           if (timerInterval) clearInterval(timerInterval);
-          showError('Connection lost. Please reload and try again.');
+          if (codeReceived) {
+            // Pairing code was shown — likely Vercel 60s timeout
+            showError('Connection timed out. Enter the code faster next time, or reload to try again.');
+          } else {
+            showError('Connection lost. Please reload and try again.');
+          }
         }
       };
     }
