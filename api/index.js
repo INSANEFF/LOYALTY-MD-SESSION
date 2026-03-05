@@ -1,13 +1,7 @@
 /*
   LOYALTY MD Session Generator API
+  Based on GlobalTechInfo/PAIRING-WEB method.
   Works on Vercel (SSE), Railway, Render, and any VPS.
-
-  Strategy (inspired by GlobalTechInfo/PAIRING-WEB):
-  1. Request pairing code ONCE
-  2. After user enters code, WhatsApp fires connection close (428)
-  3. Auto-reconnect with SAME creds — this reaches connection: 'open'
-  4. ONLY on 'open' do we grab creds and return the session ID
-  5. Clean up listeners before every reconnect
 */
 
 const {
@@ -15,6 +9,7 @@ const {
   useMultiFileAuthState,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
+  Browsers,
   delay,
   DisconnectReason
 } = require('@whiskeysockets/baileys');
@@ -27,7 +22,7 @@ const express = require('express');
 const cors = require('cors');
 
 const IS_VERCEL = !!process.env.VERCEL;
-const TIMEOUT_MS = IS_VERCEL ? 55000 : 5 * 60 * 1000; // 55s Vercel, 5 min Railway/VPS
+const TIMEOUT_MS = IS_VERCEL ? 55000 : 5 * 60 * 1000;
 const MAX_RECONNECTS = 3;
 const CLEANUP_DELAY = 5000;
 
@@ -57,7 +52,7 @@ async function getDB() {
   }
 }
 
-async function removeDir(dirPath) {
+async function removeFile(dirPath) {
   try {
     if (fs.existsSync(dirPath)) fs.rmSync(dirPath, { recursive: true, force: true });
   } catch (_) {}
@@ -65,7 +60,7 @@ async function removeDir(dirPath) {
 
 /**
  * GET /api/pair?phone=1234567890
- * Uses Server-Sent Events (SSE) to keep the connection alive.
+ * SSE endpoint — keeps connection alive for pairing flow.
  */
 app.get('/api/pair', async (req, res) => {
   const { phone } = req.query;
@@ -95,8 +90,9 @@ app.get('/api/pair', async (req, res) => {
 
   sendEvent({ type: 'status', message: 'Connecting to WhatsApp...' });
 
-  const tempDir = path.join(os.tmpdir(), `loyalty-pair-${num}-${Date.now()}`);
-  fs.mkdirSync(tempDir, { recursive: true });
+  const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
+  const dirs = path.join(os.tmpdir(), `loyalty-pair-session_${sessionId}`);
+  fs.mkdirSync(dirs, { recursive: true });
 
   let currentSocket = null;
   let sessionCompleted = false;
@@ -105,7 +101,6 @@ app.get('/api/pair', async (req, res) => {
   let reconnectAttempts = 0;
   let timeoutHandle = null;
 
-  // Cleanup everything
   async function cleanup(reason = 'unknown') {
     if (isCleaningUp) return;
     isCleaningUp = true;
@@ -121,10 +116,9 @@ app.get('/api/pair', async (req, res) => {
       currentSocket = null;
     }
 
-    setTimeout(() => removeDir(tempDir), CLEANUP_DELAY);
+    setTimeout(() => removeFile(dirs), CLEANUP_DELAY);
   }
 
-  // Main session function — called recursively on reconnect
   async function initiateSession() {
     if (sessionCompleted || isCleaningUp) return;
 
@@ -137,13 +131,11 @@ app.get('/api/pair', async (req, res) => {
     }
 
     try {
-      // Create auth dir if needed (don't wipe — reuse creds from previous attempt)
-      if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+      if (!fs.existsSync(dirs)) fs.mkdirSync(dirs, { recursive: true });
 
-      const { state, saveCreds } = await useMultiFileAuthState(tempDir);
+      const { state, saveCreds } = await useMultiFileAuthState(dirs);
       const { version } = await fetchLatestBaileysVersion();
 
-      // Clean up previous socket listeners
       if (currentSocket) {
         try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {}
       }
@@ -156,7 +148,7 @@ app.get('/api/pair', async (req, res) => {
         },
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: ["Ubuntu", "Chrome", "20.0.00"],
+        browser: Browsers.macOS('Chrome'),
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
         defaultQueryTimeoutMs: 60000,
@@ -168,7 +160,6 @@ app.get('/api/pair', async (req, res) => {
 
       const sock = currentSocket;
 
-      // Connection handler
       sock.ev.on('connection.update', async (update) => {
         if (isCleaningUp) return;
         const { connection, lastDisconnect } = update;
@@ -180,12 +171,12 @@ app.get('/api/pair', async (req, res) => {
           console.log(`[PAIR] ${num} connection OPEN — session complete!`);
 
           try {
-            const credsPath = path.join(tempDir, 'creds.json');
+            const credsPath = path.join(dirs, 'creds.json');
             if (fs.existsSync(credsPath)) {
               const credsData = fs.readFileSync(credsPath, 'utf8');
-              const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+              const sid = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
 
-              // Save to MongoDB
+              // Save to MongoDB (optional)
               try {
                 const database = await getDB();
                 if (database) {
@@ -208,7 +199,7 @@ app.get('/api/pair', async (req, res) => {
                 console.error('[DB] Save error:', dbErr.message);
               }
 
-              sendEvent({ type: 'connected', sessionId });
+              sendEvent({ type: 'connected', sessionId: sid });
             } else {
               sendEvent({ type: 'error', error: 'Credentials file not found.' });
             }
@@ -232,21 +223,17 @@ app.get('/api/pair', async (req, res) => {
           console.log(`[PAIR] ${num} closed — code: ${statusCode}`);
 
           if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-            // Logged out or invalid pairing
             console.log(`[PAIR] ${num} logged out / invalid pairing`);
             sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
             await cleanup('logged_out');
             try { res.end(); } catch (_) {}
           } else if (pairingCodeSent && !sessionCompleted) {
-            // Pairing code was sent, connection closed (likely 428 restart)
-            // Auto-reconnect with same creds
             reconnectAttempts++;
             console.log(`[PAIR] ${num} reconnecting (${reconnectAttempts}/${MAX_RECONNECTS})...`);
             sendEvent({ type: 'status', message: 'Finalizing connection...' });
             await delay(2000);
             await initiateSession();
           } else {
-            // Connection died before we even got the pairing code out
             sendEvent({ type: 'error', error: `Connection lost (code ${statusCode || 'unknown'}). Reload and try again.` });
             await cleanup('connection_closed');
             try { res.end(); } catch (_) {}
@@ -254,7 +241,6 @@ app.get('/api/pair', async (req, res) => {
         }
       });
 
-      // Request pairing code (only once)
       if (!sock.authState.creds.registered && !pairingCodeSent && !isCleaningUp) {
         await delay(1500);
         try {
@@ -272,10 +258,8 @@ app.get('/api/pair', async (req, res) => {
         }
       }
 
-      // Save creds on update
       sock.ev.on('creds.update', saveCreds);
 
-      // Session timeout
       if (!timeoutHandle) {
         timeoutHandle = setTimeout(async () => {
           if (!sessionCompleted && !isCleaningUp) {
@@ -295,7 +279,6 @@ app.get('/api/pair', async (req, res) => {
     }
   }
 
-  // Client disconnect cleanup
   req.on('close', () => {
     if (!sessionCompleted && !isCleaningUp) {
       cleanup('client_disconnect');
@@ -327,13 +310,13 @@ app.get('/', (req, res) => {
 // Suppress EventEmitter warnings
 require('events').EventEmitter.defaultMaxListeners = 500;
 
-// Ignore common Baileys errors
+// Ignore common Baileys errors (same list as PAIRING-WEB)
 process.on('uncaughtException', (err) => {
   const e = String(err);
   const ignore = [
     'conflict', 'not-authorized', 'Socket connection timeout',
     'rate-overlimit', 'Connection Closed', 'Timed Out',
-    'Value not found', 'Stream Errored', 'restart required',
+    'Value not found', 'Stream Errored', 'Stream Errored (restart required)',
     'statusCode: 515', 'statusCode: 503'
   ];
   if (!ignore.some(x => e.includes(x))) {
