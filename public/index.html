@@ -34,6 +34,33 @@
       margin-bottom: 5px;
     }
     .subtitle { color: #aaa; font-size: 14px; margin-bottom: 30px; }
+
+    /* Mode toggle */
+    .mode-toggle {
+      display: flex;
+      gap: 0;
+      margin-bottom: 25px;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+    .mode-btn {
+      flex: 1;
+      padding: 12px;
+      border: none;
+      background: rgba(255,255,255,0.05);
+      color: #aaa;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+    .mode-btn.active {
+      background: linear-gradient(135deg, #3a7bd5, #00d2ff);
+      color: #fff;
+    }
+    .mode-btn:hover:not(.active) { background: rgba(255,255,255,0.1); }
+
     .step { display: none; }
     .step.active { display: block; }
     label {
@@ -73,6 +100,8 @@
     }
     .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,210,255,0.3); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    /* Pairing code boxes */
     .pairing-code {
       display: flex;
       justify-content: center;
@@ -102,6 +131,17 @@
       color: #555;
       padding: 0 2px;
     }
+
+    /* QR code */
+    .qr-container {
+      margin: 20px auto;
+      padding: 15px;
+      background: #fff;
+      border-radius: 12px;
+      display: inline-block;
+    }
+    .qr-container img { display: block; width: 250px; height: 250px; }
+
     .copy-row {
       display: flex;
       gap: 8px;
@@ -190,19 +230,28 @@
       <div class="step-dot" id="dot3"></div>
     </div>
 
-    <!-- Step 1: Enter phone number -->
+    <!-- Step 1: Choose method & enter phone -->
     <div class="step active" id="step1">
-      <label for="phone">WhatsApp Number (with country code)</label>
-      <input type="text" id="phone" placeholder="e.g. 12025551234" />
-      <button class="btn" id="pairBtn" onclick="startPairing()">Get Pairing Code</button>
-      <div class="info warn">
+      <div class="mode-toggle">
+        <button class="mode-btn active" id="modeCode" onclick="setMode('code')">📱 Pairing Code</button>
+        <button class="mode-btn" id="modeQR" onclick="setMode('qr')">📷 QR Code</button>
+      </div>
+
+      <div id="phoneInput">
+        <label for="phone">WhatsApp Number (with country code)</label>
+        <input type="text" id="phone" placeholder="e.g. 12025551234" />
+      </div>
+
+      <button class="btn" id="startBtn" onclick="startSession()">Get Pairing Code</button>
+
+      <div class="info warn" id="infoBox">
         <strong>📌 Note:</strong> Enter the full number without + or spaces.
         This is the number that will run as a bot.
       </div>
     </div>
 
-    <!-- Step 2: Show pairing code -->
-    <div class="step" id="step2">
+    <!-- Step 2a: Pairing Code -->
+    <div class="step" id="step2code">
       <p>Enter this code on your WhatsApp:</p>
       <p style="font-size:12px; color:#aaa; margin-top:4px;">Settings → Linked Devices → Link a Device</p>
       <div class="pairing-code" id="pairingCode"></div>
@@ -213,6 +262,20 @@
       <p class="timer" id="timer">⏱ Waiting...</p>
       <div class="info warn" style="margin-top:15px;">
         Enter the code on your phone. Keep this page open until pairing completes.
+      </div>
+    </div>
+
+    <!-- Step 2b: QR Code -->
+    <div class="step" id="step2qr">
+      <p>Scan this QR code with your WhatsApp:</p>
+      <p style="font-size:12px; color:#aaa; margin-top:4px;">Settings → Linked Devices → Link a Device</p>
+      <div class="qr-container" id="qrContainer">
+        <img id="qrImage" src="" alt="QR Code" />
+      </div>
+      <p><span class="spinner"></span> Waiting for you to scan...</p>
+      <p class="timer" id="timerQR">⏱ Waiting...</p>
+      <div class="info warn" style="margin-top:15px;">
+        Scan the QR code above with your phone. Keep this page open.
       </div>
     </div>
 
@@ -240,15 +303,43 @@
   </div>
 
   <script>
+    let mode = 'code'; // 'code' or 'qr'
     let currentCode = '';
-    let currentSessionId = '';
     let timerInterval = null;
 
-    function showStep(n) {
+    function setMode(m) {
+      mode = m;
+      document.getElementById('modeCode').classList.toggle('active', m === 'code');
+      document.getElementById('modeQR').classList.toggle('active', m === 'qr');
+
+      const phoneRow = document.getElementById('phoneInput');
+      const btn = document.getElementById('startBtn');
+      const info = document.getElementById('infoBox');
+
+      if (m === 'code') {
+        phoneRow.style.display = 'block';
+        btn.textContent = 'Get Pairing Code';
+        info.innerHTML = '<strong>📌 Note:</strong> Enter the full number without + or spaces. This is the number that will run as a bot.';
+      } else {
+        phoneRow.style.display = 'none';
+        btn.textContent = 'Get QR Code';
+        info.innerHTML = '<strong>📌 Note:</strong> No phone number needed. Scan the QR code with your WhatsApp to link.';
+      }
+    }
+
+    function showStep(n, sub) {
       document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
-      const stepEl = document.getElementById('step' + n);
-      if (stepEl) stepEl.classList.add('active');
       document.getElementById('stepError')?.classList.remove('active');
+
+      if (n === 2 && sub) {
+        document.getElementById('step2' + sub).classList.add('active');
+      } else if (n === 3) {
+        document.getElementById('step3').classList.add('active');
+      } else {
+        const el = document.getElementById('step' + n);
+        if (el) el.classList.add('active');
+      }
+
       for (let i = 1; i <= 3; i++) {
         const dot = document.getElementById('dot' + i);
         dot.className = 'step-dot' + (i < n ? ' done' : (i === n ? ' active' : ''));
@@ -263,7 +354,7 @@
     }
 
     function renderCode(code) {
-      currentCode = code.replace(/-/g, ''); // store without dashes for clipboard
+      currentCode = code.replace(/-/g, '');
       const container = document.getElementById('pairingCode');
       container.innerHTML = '';
       const parts = code.split('-');
@@ -283,9 +374,10 @@
       });
     }
 
-    function startTimer(seconds) {
+    function startTimer(seconds, elId) {
       let remaining = seconds;
-      const el = document.getElementById('timer');
+      const el = document.getElementById(elId);
+      if (timerInterval) clearInterval(timerInterval);
       timerInterval = setInterval(() => {
         remaining--;
         if (remaining <= 0) {
@@ -317,25 +409,30 @@
       });
     }
 
+    function startSession() {
+      if (mode === 'code') {
+        startPairing();
+      } else {
+        startQR();
+      }
+    }
+
+    // ==================== PAIRING CODE ====================
     function startPairing() {
       const phone = document.getElementById('phone').value.replace(/[^0-9]/g, '');
       if (phone.length < 7) return alert('Please enter a valid phone number with country code.');
 
-      const btn = document.getElementById('pairBtn');
+      const btn = document.getElementById('startBtn');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Connecting...';
 
       let codeReceived = false;
-
-      // Open SSE connection
       const evtSource = new EventSource('/api/pair?phone=' + encodeURIComponent(phone));
 
       evtSource.onmessage = function(event) {
         try {
           const data = JSON.parse(event.data);
-          
           if (data.type === 'status') {
-            // Status update — if we already have the code, show on step 2
             if (codeReceived) {
               document.getElementById('timer').textContent = '⏳ ' + data.message;
             } else {
@@ -343,16 +440,13 @@
             }
           }
           else if (data.type === 'code') {
-            // Got pairing code!
             codeReceived = true;
             renderCode(data.code);
-            showStep(2);
-            startTimer(300); // 5 min generous timer, server handles real timeout
+            showStep(2, 'code');
+            startTimer(300, 'timer');
           }
           else if (data.type === 'connected') {
-            // Success! Got session ID
             if (timerInterval) clearInterval(timerInterval);
-            currentSessionId = data.sessionId;
             document.getElementById('sessionIdBox').textContent = data.sessionId;
             showStep(3);
             evtSource.close();
@@ -362,20 +456,69 @@
             showError(data.error || 'An error occurred.');
             evtSource.close();
           }
-        } catch (e) {
-          console.error('Parse error:', e);
-        }
+        } catch (e) { console.error('Parse error:', e); }
       };
 
       evtSource.onerror = function() {
         evtSource.close();
-        // Only show error if we haven't already completed
         const step3 = document.getElementById('step3');
         if (!step3.classList.contains('active')) {
           if (timerInterval) clearInterval(timerInterval);
           if (codeReceived) {
-            // Pairing code was shown — likely Vercel 60s timeout
             showError('Connection timed out. Enter the code faster next time, or reload to try again.');
+          } else {
+            showError('Connection lost. Please reload and try again.');
+          }
+        }
+      };
+    }
+
+    // ==================== QR CODE ====================
+    function startQR() {
+      const btn = document.getElementById('startBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Generating QR...';
+
+      let qrReceived = false;
+      const evtSource = new EventSource('/api/qr');
+
+      evtSource.onmessage = function(event) {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'status') {
+            if (qrReceived) {
+              document.getElementById('timerQR').textContent = '⏳ ' + data.message;
+            } else {
+              btn.innerHTML = '<span class="spinner"></span> ' + data.message;
+            }
+          }
+          else if (data.type === 'qr') {
+            qrReceived = true;
+            document.getElementById('qrImage').src = data.qr;
+            showStep(2, 'qr');
+            startTimer(300, 'timerQR');
+          }
+          else if (data.type === 'connected') {
+            if (timerInterval) clearInterval(timerInterval);
+            document.getElementById('sessionIdBox').textContent = data.sessionId;
+            showStep(3);
+            evtSource.close();
+          }
+          else if (data.type === 'error') {
+            if (timerInterval) clearInterval(timerInterval);
+            showError(data.error || 'An error occurred.');
+            evtSource.close();
+          }
+        } catch (e) { console.error('Parse error:', e); }
+      };
+
+      evtSource.onerror = function() {
+        evtSource.close();
+        const step3 = document.getElementById('step3');
+        if (!step3.classList.contains('active')) {
+          if (timerInterval) clearInterval(timerInterval);
+          if (qrReceived) {
+            showError('Connection timed out. Scan the QR faster, or reload to try again.');
           } else {
             showError('Connection lost. Please reload and try again.');
           }

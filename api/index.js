@@ -1,25 +1,27 @@
-/*
-  LOYALTY MD Session Generator API
-  Based on GlobalTechInfo/PAIRING-WEB method.
-  Works on Vercel (SSE), Railway, Render, and any VPS.
-*/
-
-const {
-  default: makeWASocket,
+import {
+  makeWASocket,
   useMultiFileAuthState,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
   Browsers,
   delay,
   DisconnectReason
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const { MongoClient } = require('mongodb');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const express = require('express');
-const cors = require('cors');
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import express from 'express';
+import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import { MongoClient } from 'mongodb';
+import events from 'events';
+
+events.EventEmitter.defaultMaxListeners = 500;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const IS_VERCEL = !!process.env.VERCEL;
 const TIMEOUT_MS = IS_VERCEL ? 55000 : 5 * 60 * 1000;
@@ -31,44 +33,31 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// MongoDB connection (optional)
+// MongoDB (optional)
 let db = null;
 async function getDB() {
   if (db) return db;
   const uri = process.env.MONGODB_URI;
   if (!uri) return null;
   try {
-    const client = new MongoClient(uri, {
-      connectTimeoutMS: 10000,
-      serverSelectionTimeoutMS: 10000
-    });
+    const client = new MongoClient(uri, { connectTimeoutMS: 10000, serverSelectionTimeoutMS: 10000 });
     await client.connect();
     db = client.db('loyaltymd');
-    console.log('[DB] Connected to MongoDB');
     return db;
-  } catch (err) {
-    console.error('[DB] MongoDB connection failed:', err.message);
-    return null;
-  }
+  } catch (_) { return null; }
 }
 
-async function removeFile(dirPath) {
-  try {
-    if (fs.existsSync(dirPath)) fs.rmSync(dirPath, { recursive: true, force: true });
-  } catch (_) {}
+async function removeFile(p) {
+  try { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch (_) {}
 }
 
-/**
- * GET /api/pair?phone=1234567890
- * SSE endpoint — keeps connection alive for pairing flow.
- */
+// ============================================================
+//  PAIRING CODE endpoint — SSE
+// ============================================================
 app.get('/api/pair', async (req, res) => {
   const { phone } = req.query;
   if (!phone || phone.replace(/[^0-9]/g, '').length < 7) {
-    if (req.headers.accept !== 'text/event-stream') {
-      return res.json({ success: false, error: 'Invalid phone number.' });
-    }
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     res.write(`data: ${JSON.stringify({ type: 'error', error: 'Invalid phone number.' })}\n\n`);
     res.end();
     return;
@@ -76,83 +65,52 @@ app.get('/api/pair', async (req, res) => {
 
   const num = phone.replace(/[^0-9]/g, '');
 
-  // SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
+    Connection: 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
 
-  function sendEvent(data) {
-    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (_) {}
-  }
+  const send = (d) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch (_) {} };
+  send({ type: 'status', message: 'Connecting to WhatsApp...' });
 
-  sendEvent({ type: 'status', message: 'Connecting to WhatsApp...' });
-
-  const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
-  const dirs = path.join(os.tmpdir(), `loyalty-pair-session_${sessionId}`);
+  const sid = Date.now().toString() + Math.random().toString(36).substring(2, 9);
+  const dirs = path.join(os.tmpdir(), `loyalty-pair-${sid}`);
   fs.mkdirSync(dirs, { recursive: true });
 
-  let currentSocket = null;
-  let sessionCompleted = false;
-  let isCleaningUp = false;
-  let pairingCodeSent = false;
-  let reconnectAttempts = 0;
-  let timeoutHandle = null;
-  let heartbeatHandle = null;
+  let currentSocket = null, sessionCompleted = false, isCleaningUp = false;
+  let pairingCodeSent = false, reconnectAttempts = 0, timeoutHandle = null;
 
-  // Send SSE heartbeat every 10s to prevent Vercel/proxy from closing the connection
-  heartbeatHandle = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch (_) {}
-  }, 10000);
+  // Heartbeat to keep SSE alive
+  const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) {} }, 10000);
 
-  async function cleanup(reason = 'unknown') {
+  async function cleanup(reason) {
     if (isCleaningUp) return;
     isCleaningUp = true;
-    console.log(`[PAIR] Cleanup ${num} — ${reason}`);
-
     if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
-    if (heartbeatHandle) { clearInterval(heartbeatHandle); heartbeatHandle = null; }
-
-    if (currentSocket) {
-      try {
-        currentSocket.ev.removeAllListeners();
-        currentSocket.end();
-      } catch (_) {}
-      currentSocket = null;
-    }
-
+    if (heartbeat) clearInterval(heartbeat);
+    if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} currentSocket = null; }
     setTimeout(() => removeFile(dirs), CLEANUP_DELAY);
   }
 
   async function initiateSession() {
     if (sessionCompleted || isCleaningUp) return;
-
     if (reconnectAttempts >= MAX_RECONNECTS) {
-      console.log(`[PAIR] Max reconnects reached for ${num}`);
-      sendEvent({ type: 'error', error: 'Connection failed after multiple attempts. Reload and try again.' });
-      await cleanup('max_reconnects');
-      try { res.end(); } catch (_) {}
-      return;
+      send({ type: 'error', error: 'Connection failed after multiple attempts. Reload and try again.' });
+      await cleanup('max_reconnects'); try { res.end(); } catch (_) {} return;
     }
 
     try {
       if (!fs.existsSync(dirs)) fs.mkdirSync(dirs, { recursive: true });
-
       const { state, saveCreds } = await useMultiFileAuthState(dirs);
       const { version } = await fetchLatestBaileysVersion();
 
-      if (currentSocket) {
-        try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {}
-      }
+      if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} }
 
       currentSocket = makeWASocket({
         version,
-        auth: {
-          creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
-        },
+        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })) },
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
         browser: Browsers.macOS('Chrome'),
@@ -174,45 +132,27 @@ app.get('/api/pair', async (req, res) => {
         if (connection === 'open') {
           if (sessionCompleted) return;
           sessionCompleted = true;
-
-          console.log(`[PAIR] ${num} connection OPEN — session complete!`);
-
           try {
             const credsPath = path.join(dirs, 'creds.json');
             if (fs.existsSync(credsPath)) {
               const credsData = fs.readFileSync(credsPath, 'utf8');
-              const sid = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
-
-              // Save to MongoDB (optional)
+              const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
               try {
                 const database = await getDB();
                 if (database) {
                   await database.collection('sessions').updateOne(
                     { sessionId: `session_${num}` },
-                    {
-                      $set: {
-                        sessionId: `session_${num}`,
-                        creds: credsData,
-                        phone: num,
-                        active: true,
-                        updatedAt: new Date()
-                      },
-                      $setOnInsert: { createdAt: new Date() }
-                    },
+                    { $set: { sessionId: `session_${num}`, creds: credsData, phone: num, active: true, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
                     { upsert: true }
                   );
                 }
-              } catch (dbErr) {
-                console.error('[DB] Save error:', dbErr.message);
-              }
-
-              sendEvent({ type: 'connected', sessionId: sid });
+              } catch (_) {}
+              send({ type: 'connected', sessionId });
             } else {
-              sendEvent({ type: 'error', error: 'Credentials file not found.' });
+              send({ type: 'error', error: 'Credentials file not found.' });
             }
           } catch (err) {
-            console.error('[PAIR] Error reading creds:', err);
-            sendEvent({ type: 'error', error: 'Failed to read session.' });
+            send({ type: 'error', error: 'Failed to read session.' });
           } finally {
             await delay(1000);
             await cleanup('session_complete');
@@ -221,25 +161,14 @@ app.get('/api/pair', async (req, res) => {
         }
 
         if (connection === 'close') {
-          if (sessionCompleted || isCleaningUp) {
-            await cleanup('already_complete');
-            return;
-          }
-
-          const statusCode = lastDisconnect?.error?.output?.statusCode;
-          console.log(`[PAIR] ${num} closed — code: ${statusCode}`);
-
-          if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-            console.log(`[PAIR] ${num} logged out / invalid pairing`);
-            sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
-            await cleanup('logged_out');
-            try { res.end(); } catch (_) {}
+          if (sessionCompleted || isCleaningUp) { await cleanup('done'); return; }
+          const code = lastDisconnect?.error?.output?.statusCode;
+          if (code === DisconnectReason.loggedOut || code === 401) {
+            send({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
+            await cleanup('logged_out'); try { res.end(); } catch (_) {}
           } else if (!sessionCompleted) {
-            // Reconnect whether pairing code was sent or not
-            // Initial connection can drop on cold start / serverless
             reconnectAttempts++;
-            console.log(`[PAIR] ${num} reconnecting (${reconnectAttempts}/${MAX_RECONNECTS})...`);
-            sendEvent({ type: 'status', message: pairingCodeSent ? 'Finalizing connection...' : 'Reconnecting...' });
+            send({ type: 'status', message: pairingCodeSent ? 'Finalizing connection...' : 'Reconnecting...' });
             await delay(1000);
             await initiateSession();
           }
@@ -252,14 +181,11 @@ app.get('/api/pair', async (req, res) => {
           pairingCodeSent = true;
           let code = await sock.requestPairingCode(num);
           code = code?.match(/.{1,4}/g)?.join('-') || code;
-          console.log(`[PAIR] Code for ${num}: ${code}`);
-          sendEvent({ type: 'code', code });
+          send({ type: 'code', code });
         } catch (err) {
-          console.error('[PAIR] Pairing code error:', err.message);
           pairingCodeSent = false;
-          sendEvent({ type: 'error', error: 'Failed to get pairing code. Reload and try again.' });
-          await cleanup('pairing_code_error');
-          try { res.end(); } catch (_) {}
+          send({ type: 'error', error: 'Failed to get pairing code. Reload and try again.' });
+          await cleanup('pairing_code_error'); try { res.end(); } catch (_) {}
         }
       }
 
@@ -268,40 +194,170 @@ app.get('/api/pair', async (req, res) => {
       if (!timeoutHandle) {
         timeoutHandle = setTimeout(async () => {
           if (!sessionCompleted && !isCleaningUp) {
-            console.log(`[PAIR] Timeout for ${num}`);
-            sendEvent({ type: 'error', error: 'Pairing timed out. Reload and try again.' });
-            await cleanup('timeout');
-            try { res.end(); } catch (_) {}
+            send({ type: 'error', error: 'Pairing timed out. Reload and try again.' });
+            await cleanup('timeout'); try { res.end(); } catch (_) {}
           }
         }, TIMEOUT_MS);
       }
-
     } catch (err) {
-      console.error(`[PAIR] Init error for ${num}:`, err);
-      sendEvent({ type: 'error', error: 'Failed to connect. Reload and try again.' });
-      await cleanup('init_error');
-      try { res.end(); } catch (_) {}
+      console.error('[PAIR] Init error:', err);
+      send({ type: 'error', error: 'Failed to connect. Reload and try again.' });
+      await cleanup('init_error'); try { res.end(); } catch (_) {}
     }
   }
 
-  req.on('close', () => {
-    if (!sessionCompleted && !isCleaningUp) {
-      cleanup('client_disconnect');
-    }
-  });
-
+  req.on('close', () => { if (!sessionCompleted && !isCleaningUp) cleanup('client_disconnect'); });
   await initiateSession();
 });
 
-// Legacy POST endpoint
-app.post('/api/pair', async (req, res) => {
+// ============================================================
+//  QR CODE endpoint — SSE
+// ============================================================
+app.get('/api/qr', async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+
+  const send = (d) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch (_) {} };
+  send({ type: 'status', message: 'Generating QR code...' });
+
+  const sid = Date.now().toString() + Math.random().toString(36).substring(2, 9);
+  const dirs = path.join(os.tmpdir(), `loyalty-qr-${sid}`);
+  fs.mkdirSync(dirs, { recursive: true });
+
+  let currentSocket = null, sessionCompleted = false, isCleaningUp = false;
+  let qrSent = false, reconnectAttempts = 0, timeoutHandle = null;
+
+  const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) {} }, 10000);
+
+  async function cleanup(reason) {
+    if (isCleaningUp) return;
+    isCleaningUp = true;
+    if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+    if (heartbeat) clearInterval(heartbeat);
+    if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} currentSocket = null; }
+    setTimeout(() => removeFile(dirs), CLEANUP_DELAY);
+  }
+
+  async function initiateSession() {
+    if (sessionCompleted || isCleaningUp) return;
+    if (reconnectAttempts >= MAX_RECONNECTS) {
+      send({ type: 'error', error: 'Connection failed. Reload and try again.' });
+      await cleanup('max_reconnects'); try { res.end(); } catch (_) {} return;
+    }
+
+    try {
+      if (!fs.existsSync(dirs)) fs.mkdirSync(dirs, { recursive: true });
+      const { state, saveCreds } = await useMultiFileAuthState(dirs);
+      const { version } = await fetchLatestBaileysVersion();
+
+      if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} }
+
+      currentSocket = makeWASocket({
+        version,
+        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })) },
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: Browsers.macOS('Chrome'),
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
+        defaultQueryTimeoutMs: 60000,
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 30000,
+        retryRequestDelayMs: 250,
+        maxRetries: 3
+      });
+
+      const sock = currentSocket;
+
+      sock.ev.on('connection.update', async (update) => {
+        if (isCleaningUp) return;
+        const { connection, lastDisconnect, qr } = update;
+
+        // QR code received — send as base64 image
+        if (qr && !sessionCompleted) {
+          try {
+            const qrDataURL = await QRCode.toDataURL(qr, { errorCorrectionLevel: 'M', width: 300 });
+            send({ type: 'qr', qr: qrDataURL });
+            qrSent = true;
+          } catch (_) {}
+        }
+
+        if (connection === 'open') {
+          if (sessionCompleted) return;
+          sessionCompleted = true;
+          try {
+            const credsPath = path.join(dirs, 'creds.json');
+            if (fs.existsSync(credsPath)) {
+              const credsData = fs.readFileSync(credsPath, 'utf8');
+              const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+              try {
+                const database = await getDB();
+                if (database) {
+                  await database.collection('sessions').updateOne(
+                    { sessionId: `session_qr_${sid}` },
+                    { $set: { sessionId: `session_qr_${sid}`, creds: credsData, active: true, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+                    { upsert: true }
+                  );
+                }
+              } catch (_) {}
+              send({ type: 'connected', sessionId });
+            } else {
+              send({ type: 'error', error: 'Credentials file not found.' });
+            }
+          } catch (err) {
+            send({ type: 'error', error: 'Failed to read session.' });
+          } finally {
+            await delay(1000);
+            await cleanup('session_complete');
+            try { res.end(); } catch (_) {}
+          }
+        }
+
+        if (connection === 'close') {
+          if (sessionCompleted || isCleaningUp) { await cleanup('done'); return; }
+          const code = lastDisconnect?.error?.output?.statusCode;
+          if (code === DisconnectReason.loggedOut || code === 401) {
+            send({ type: 'error', error: 'Session rejected. Reload and try again.' });
+            await cleanup('logged_out'); try { res.end(); } catch (_) {}
+          } else if (!sessionCompleted) {
+            reconnectAttempts++;
+            send({ type: 'status', message: 'Reconnecting...' });
+            await delay(1000);
+            await initiateSession();
+          }
+        }
+      });
+
+      sock.ev.on('creds.update', saveCreds);
+
+      if (!timeoutHandle) {
+        timeoutHandle = setTimeout(async () => {
+          if (!sessionCompleted && !isCleaningUp) {
+            send({ type: 'error', error: 'QR pairing timed out. Reload and try again.' });
+            await cleanup('timeout'); try { res.end(); } catch (_) {}
+          }
+        }, TIMEOUT_MS);
+      }
+    } catch (err) {
+      console.error('[QR] Init error:', err);
+      send({ type: 'error', error: 'Failed to connect. Reload and try again.' });
+      await cleanup('init_error'); try { res.end(); } catch (_) {}
+    }
+  }
+
+  req.on('close', () => { if (!sessionCompleted && !isCleaningUp) cleanup('client_disconnect'); });
+  await initiateSession();
+});
+
+// Legacy POST
+app.post('/api/pair', (req, res) => {
   const phone = req.body?.phone;
   if (!phone) return res.json({ success: false, error: 'Missing phone number.' });
-  return res.json({
-    success: false,
-    error: 'Use the web interface instead.',
-    redirect: `/api/pair?phone=${phone.replace(/[^0-9]/g, '')}`
-  });
+  res.json({ success: false, error: 'Use the web interface.', redirect: `/api/pair?phone=${phone.replace(/[^0-9]/g, '')}` });
 });
 
 app.get('/api/health', (req, res) => {
@@ -312,24 +368,15 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-// Suppress EventEmitter warnings
-require('events').EventEmitter.defaultMaxListeners = 500;
-
-// Ignore common Baileys errors (same list as PAIRING-WEB)
+// Ignore common Baileys crashes
 process.on('uncaughtException', (err) => {
   const e = String(err);
-  const ignore = [
-    'conflict', 'not-authorized', 'Socket connection timeout',
-    'rate-overlimit', 'Connection Closed', 'Timed Out',
-    'Value not found', 'Stream Errored', 'Stream Errored (restart required)',
-    'statusCode: 515', 'statusCode: 503'
-  ];
-  if (!ignore.some(x => e.includes(x))) {
-    console.error('[UNCAUGHT]', err);
-  }
+  const ignore = ['conflict', 'not-authorized', 'Socket connection timeout', 'rate-overlimit',
+    'Connection Closed', 'Timed Out', 'Value not found', 'Stream Errored', 'restart required',
+    'statusCode: 515', 'statusCode: 503'];
+  if (!ignore.some(x => e.includes(x))) console.error('[UNCAUGHT]', err);
 });
 
-// Start server (Railway, Render, VPS, local dev)
 const PORT = process.env.PORT || 3000;
 if (!IS_VERCEL) {
   app.listen(PORT, '0.0.0.0', () => {
@@ -341,4 +388,4 @@ if (!IS_VERCEL) {
   });
 }
 
-module.exports = app;
+export default app;
