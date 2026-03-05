@@ -17,6 +17,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { MongoClient } from 'mongodb';
 import events from 'events';
+import config from '../config.js';
 
 events.EventEmitter.defaultMaxListeners = 500;
 
@@ -37,7 +38,8 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 let db = null;
 async function getDB() {
   if (db) return db;
-  const uri = process.env.MONGODB_URI;
+  // Check env var first, then config.js fallback
+  const uri = process.env.MONGODB_URI || config.MONGODB_URI || '';
   if (!uri) return null;
   try {
     const client = new MongoClient(uri, { connectTimeoutMS: 10000, serverSelectionTimeoutMS: 10000 });
