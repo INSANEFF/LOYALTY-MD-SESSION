@@ -51,6 +51,23 @@ async function removeFile(p) {
   try { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch (_) {}
 }
 
+/**
+ * Wait for creds.json to appear on disk (creds.update event writes it)
+ */
+async function waitForCreds(credsPath, maxWait = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    if (fs.existsSync(credsPath)) {
+      try {
+        const data = fs.readFileSync(credsPath, 'utf8');
+        if (data && data.length > 10) return data;
+      } catch (_) {}
+    }
+    await delay(500);
+  }
+  return null;
+}
+
 // ============================================================
 //  PAIRING CODE endpoint — SSE
 // ============================================================
@@ -82,15 +99,17 @@ app.get('/api/pair', async (req, res) => {
   let currentSocket = null, sessionCompleted = false, isCleaningUp = false;
   let pairingCodeSent = false, reconnectAttempts = 0, timeoutHandle = null;
 
-  // Heartbeat to keep SSE alive
   const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) {} }, 10000);
 
   async function cleanup(reason) {
     if (isCleaningUp) return;
     isCleaningUp = true;
     if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
-    if (heartbeat) clearInterval(heartbeat);
-    if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} currentSocket = null; }
+    clearInterval(heartbeat);
+    if (currentSocket) {
+      try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {}
+      currentSocket = null;
+    }
     setTimeout(() => removeFile(dirs), CLEANUP_DELAY);
   }
 
@@ -106,15 +125,20 @@ app.get('/api/pair', async (req, res) => {
       const { state, saveCreds } = await useMultiFileAuthState(dirs);
       const { version } = await fetchLatestBaileysVersion();
 
-      if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} }
+      if (currentSocket) {
+        try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {}
+      }
 
       currentSocket = makeWASocket({
         version,
-        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })) },
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+        },
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
         browser: Browsers.macOS('Chrome'),
-        markOnlineOnConnect: false,
+        markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
         defaultQueryTimeoutMs: 60000,
         connectTimeoutMs: 60000,
@@ -125,6 +149,9 @@ app.get('/api/pair', async (req, res) => {
 
       const sock = currentSocket;
 
+      // Save creds on every update (this writes creds.json)
+      sock.ev.on('creds.update', saveCreds);
+
       sock.ev.on('connection.update', async (update) => {
         if (isCleaningUp) return;
         const { connection, lastDisconnect } = update;
@@ -132,23 +159,36 @@ app.get('/api/pair', async (req, res) => {
         if (connection === 'open') {
           if (sessionCompleted) return;
           sessionCompleted = true;
-          try {
-            // Force save creds first, then wait for file write
-            await saveCreds();
-            await delay(2000);
 
+          try {
+            // Wait for creds.json to be written by creds.update listener
             const credsPath = path.join(dirs, 'creds.json');
-            let credsData = null;
-            for (let attempt = 0; attempt < 5; attempt++) {
-              if (fs.existsSync(credsPath)) {
-                credsData = fs.readFileSync(credsPath, 'utf8');
-                break;
-              }
-              await delay(1000);
-            }
+            const credsData = await waitForCreds(credsPath);
 
             if (credsData) {
               const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+
+              // Send session ID as a WhatsApp message to the user's own chat
+              try {
+                const ownerJid = sock.user?.id;
+                if (ownerJid) {
+                  await sock.sendMessage(ownerJid, {
+                    text: `✅ *LOYALTY MD Session Generated!*\n\n` +
+                          `📱 *Your Session ID:*\n\n` +
+                          `${sessionId}\n\n` +
+                          `━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                          `📌 *How to use:*\n` +
+                          `1. Set this as SESSION_ID env var in your hosting panel\n` +
+                          `2. Or send: addsession <paste_id> to your running bot\n\n` +
+                          `👑 *LOYALTY MD*`
+                  });
+                  send({ type: 'status', message: 'Session ID sent to your WhatsApp!' });
+                }
+              } catch (dmErr) {
+                console.error('[PAIR] DM error:', dmErr.message);
+              }
+
+              // Save to MongoDB (optional)
               try {
                 const database = await getDB();
                 if (database) {
@@ -159,14 +199,17 @@ app.get('/api/pair', async (req, res) => {
                   );
                 }
               } catch (_) {}
+
+              // Send to web UI
               send({ type: 'connected', sessionId });
             } else {
-              send({ type: 'error', error: 'Credentials file not found. Please try again.' });
+              send({ type: 'error', error: 'Credentials file not found. Try again.' });
             }
           } catch (err) {
+            console.error('[PAIR] Session read error:', err);
             send({ type: 'error', error: 'Failed to read session.' });
           } finally {
-            await delay(1000);
+            await delay(2000);
             await cleanup('session_complete');
             try { res.end(); } catch (_) {}
           }
@@ -187,6 +230,7 @@ app.get('/api/pair', async (req, res) => {
         }
       });
 
+      // Request pairing code if not yet registered
       if (!sock.authState.creds.registered && !pairingCodeSent && !isCleaningUp) {
         await delay(500);
         try {
@@ -195,13 +239,12 @@ app.get('/api/pair', async (req, res) => {
           code = code?.match(/.{1,4}/g)?.join('-') || code;
           send({ type: 'code', code });
         } catch (err) {
+          console.error('[PAIR] Pairing code error:', err.message);
           pairingCodeSent = false;
           send({ type: 'error', error: 'Failed to get pairing code. Reload and try again.' });
           await cleanup('pairing_code_error'); try { res.end(); } catch (_) {}
         }
       }
-
-      sock.ev.on('creds.update', saveCreds);
 
       if (!timeoutHandle) {
         timeoutHandle = setTimeout(async () => {
@@ -241,7 +284,7 @@ app.get('/api/qr', async (req, res) => {
   fs.mkdirSync(dirs, { recursive: true });
 
   let currentSocket = null, sessionCompleted = false, isCleaningUp = false;
-  let qrSent = false, reconnectAttempts = 0, timeoutHandle = null;
+  let qrCount = 0, reconnectAttempts = 0, timeoutHandle = null;
 
   const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) {} }, 10000);
 
@@ -249,8 +292,11 @@ app.get('/api/qr', async (req, res) => {
     if (isCleaningUp) return;
     isCleaningUp = true;
     if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
-    if (heartbeat) clearInterval(heartbeat);
-    if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} currentSocket = null; }
+    clearInterval(heartbeat);
+    if (currentSocket) {
+      try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {}
+      currentSocket = null;
+    }
     setTimeout(() => removeFile(dirs), CLEANUP_DELAY);
   }
 
@@ -266,15 +312,20 @@ app.get('/api/qr', async (req, res) => {
       const { state, saveCreds } = await useMultiFileAuthState(dirs);
       const { version } = await fetchLatestBaileysVersion();
 
-      if (currentSocket) { try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {} }
+      if (currentSocket) {
+        try { currentSocket.ev.removeAllListeners(); currentSocket.end(); } catch (_) {}
+      }
 
       currentSocket = makeWASocket({
         version,
-        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })) },
-        printQRInTerminal: false,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' }))
+        },
+        printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
         browser: Browsers.macOS('Chrome'),
-        markOnlineOnConnect: false,
+        markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
         defaultQueryTimeoutMs: 60000,
         connectTimeoutMs: 60000,
@@ -285,40 +336,65 @@ app.get('/api/qr', async (req, res) => {
 
       const sock = currentSocket;
 
+      // Save creds on every update
+      sock.ev.on('creds.update', saveCreds);
+
       sock.ev.on('connection.update', async (update) => {
         if (isCleaningUp) return;
         const { connection, lastDisconnect, qr } = update;
 
-        // QR code received — send as base64 image
+        // QR code received — convert to base64 PNG and send via SSE
         if (qr && !sessionCompleted) {
+          qrCount++;
+          console.log(`[QR] QR code #${qrCount} received (${qr.length} chars)`);
           try {
-            const qrDataURL = await QRCode.toDataURL(qr, { errorCorrectionLevel: 'M', width: 300 });
+            const qrDataURL = await QRCode.toDataURL(qr, {
+              errorCorrectionLevel: 'M',
+              width: 300,
+              margin: 2
+            });
             send({ type: 'qr', qr: qrDataURL });
-            qrSent = true;
-          } catch (_) {}
+            console.log(`[QR] QR image sent to client (${qrDataURL.length} bytes)`);
+          } catch (qrErr) {
+            console.error('[QR] QR generation error:', qrErr.message);
+            // Fallback: send the raw QR string
+            send({ type: 'qr_raw', qr: qr });
+          }
         }
 
         if (connection === 'open') {
           if (sessionCompleted) return;
           sessionCompleted = true;
-          try {
-            // Force save creds first, then wait for file write
-            await saveCreds();
-            await delay(2000);
+          console.log('[QR] Connection opened!');
 
+          try {
             const credsPath = path.join(dirs, 'creds.json');
-            // Retry reading creds (race condition safety)
-            let credsData = null;
-            for (let attempt = 0; attempt < 5; attempt++) {
-              if (fs.existsSync(credsPath)) {
-                credsData = fs.readFileSync(credsPath, 'utf8');
-                break;
-              }
-              await delay(1000);
-            }
+            const credsData = await waitForCreds(credsPath);
 
             if (credsData) {
               const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
+
+              // Send session ID via WhatsApp DM
+              try {
+                const ownerJid = sock.user?.id;
+                if (ownerJid) {
+                  await sock.sendMessage(ownerJid, {
+                    text: `✅ *LOYALTY MD Session Generated (QR)!*\n\n` +
+                          `📱 *Your Session ID:*\n\n` +
+                          `${sessionId}\n\n` +
+                          `━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                          `📌 *How to use:*\n` +
+                          `1. Set this as SESSION_ID env var in your hosting panel\n` +
+                          `2. Or send: addsession <paste_id> to your running bot\n\n` +
+                          `👑 *LOYALTY MD*`
+                  });
+                  send({ type: 'status', message: 'Session ID sent to your WhatsApp!' });
+                }
+              } catch (dmErr) {
+                console.error('[QR] DM error:', dmErr.message);
+              }
+
+              // Save to MongoDB
               try {
                 const database = await getDB();
                 if (database) {
@@ -329,14 +405,16 @@ app.get('/api/qr', async (req, res) => {
                   );
                 }
               } catch (_) {}
+
               send({ type: 'connected', sessionId });
             } else {
-              send({ type: 'error', error: 'Credentials file not found. Please try again.' });
+              send({ type: 'error', error: 'Credentials file not found. Try again.' });
             }
           } catch (err) {
+            console.error('[QR] Session read error:', err);
             send({ type: 'error', error: 'Failed to read session.' });
           } finally {
-            await delay(1000);
+            await delay(2000);
             await cleanup('session_complete');
             try { res.end(); } catch (_) {}
           }
@@ -356,8 +434,6 @@ app.get('/api/qr', async (req, res) => {
           }
         }
       });
-
-      sock.ev.on('creds.update', saveCreds);
 
       if (!timeoutHandle) {
         timeoutHandle = setTimeout(async () => {
