@@ -15,7 +15,6 @@ const {
   useMultiFileAuthState,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
-  Browsers,
   delay,
   DisconnectReason
 } = require('@whiskeysockets/baileys');
@@ -157,7 +156,7 @@ app.get('/api/pair', async (req, res) => {
         },
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Chrome'),
+        browser: ["Ubuntu", "Chrome", "20.0.00"],
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
         defaultQueryTimeoutMs: 60000,
