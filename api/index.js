@@ -133,9 +133,21 @@ app.get('/api/pair', async (req, res) => {
           if (sessionCompleted) return;
           sessionCompleted = true;
           try {
+            // Force save creds first, then wait for file write
+            await saveCreds();
+            await delay(2000);
+
             const credsPath = path.join(dirs, 'creds.json');
-            if (fs.existsSync(credsPath)) {
-              const credsData = fs.readFileSync(credsPath, 'utf8');
+            let credsData = null;
+            for (let attempt = 0; attempt < 5; attempt++) {
+              if (fs.existsSync(credsPath)) {
+                credsData = fs.readFileSync(credsPath, 'utf8');
+                break;
+              }
+              await delay(1000);
+            }
+
+            if (credsData) {
               const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
               try {
                 const database = await getDB();
@@ -149,7 +161,7 @@ app.get('/api/pair', async (req, res) => {
               } catch (_) {}
               send({ type: 'connected', sessionId });
             } else {
-              send({ type: 'error', error: 'Credentials file not found.' });
+              send({ type: 'error', error: 'Credentials file not found. Please try again.' });
             }
           } catch (err) {
             send({ type: 'error', error: 'Failed to read session.' });
@@ -290,9 +302,22 @@ app.get('/api/qr', async (req, res) => {
           if (sessionCompleted) return;
           sessionCompleted = true;
           try {
+            // Force save creds first, then wait for file write
+            await saveCreds();
+            await delay(2000);
+
             const credsPath = path.join(dirs, 'creds.json');
-            if (fs.existsSync(credsPath)) {
-              const credsData = fs.readFileSync(credsPath, 'utf8');
+            // Retry reading creds (race condition safety)
+            let credsData = null;
+            for (let attempt = 0; attempt < 5; attempt++) {
+              if (fs.existsSync(credsPath)) {
+                credsData = fs.readFileSync(credsPath, 'utf8');
+                break;
+              }
+              await delay(1000);
+            }
+
+            if (credsData) {
               const sessionId = `LOYALTY-MD~${Buffer.from(credsData).toString('base64')}`;
               try {
                 const database = await getDB();
@@ -306,7 +331,7 @@ app.get('/api/qr', async (req, res) => {
               } catch (_) {}
               send({ type: 'connected', sessionId });
             } else {
-              send({ type: 'error', error: 'Credentials file not found.' });
+              send({ type: 'error', error: 'Credentials file not found. Please try again.' });
             }
           } catch (err) {
             send({ type: 'error', error: 'Failed to read session.' });
