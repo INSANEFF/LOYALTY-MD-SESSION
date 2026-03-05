@@ -23,7 +23,7 @@ const cors = require('cors');
 
 const IS_VERCEL = !!process.env.VERCEL;
 const TIMEOUT_MS = IS_VERCEL ? 55000 : 5 * 60 * 1000;
-const MAX_RECONNECTS = 3;
+const MAX_RECONNECTS = 5;
 const CLEANUP_DELAY = 5000;
 
 const app = express();
@@ -227,16 +227,14 @@ app.get('/api/pair', async (req, res) => {
             sendEvent({ type: 'error', error: 'Pairing rejected or expired. Reload and try again.' });
             await cleanup('logged_out');
             try { res.end(); } catch (_) {}
-          } else if (pairingCodeSent && !sessionCompleted) {
+          } else if (!sessionCompleted) {
+            // Reconnect whether pairing code was sent or not
+            // Initial connection can drop on cold start / serverless
             reconnectAttempts++;
             console.log(`[PAIR] ${num} reconnecting (${reconnectAttempts}/${MAX_RECONNECTS})...`);
-            sendEvent({ type: 'status', message: 'Finalizing connection...' });
+            sendEvent({ type: 'status', message: pairingCodeSent ? 'Finalizing connection...' : 'Reconnecting...' });
             await delay(2000);
             await initiateSession();
-          } else {
-            sendEvent({ type: 'error', error: `Connection lost (code ${statusCode || 'unknown'}). Reload and try again.` });
-            await cleanup('connection_closed');
-            try { res.end(); } catch (_) {}
           }
         }
       });
